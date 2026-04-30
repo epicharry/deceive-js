@@ -4,44 +4,50 @@ const { startProxy, stopProxy } = require('./proxy');
 let mainWindow = null;
 
 // --- Configuration ---
+// autoLaunch: true  -> automatically kills existing Riot Client and relaunches with proxy
+// riotClientPath:   -> override path to RiotClientServices.exe (auto-detected if omitted)
+// chatProxyPort:    -> port for TLS chat proxy (0 = auto-assign)
 const PROXY_CONFIG = {
-  riotChatHost: 'ap.chat.si.riotgames.com', // Change per region: na, eu, ap, kr, etc.
-  riotChatPort: 5223,
-  listenPort: 5223,
+  autoLaunch: true,
+  chatProxyPort: 0,
+  // riotClientPath: 'C:\\Riot Games\\Riot Client\\RiotClientServices.exe',
 };
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 400,
-    height: 300,
+    width: 420,
+    height: 320,
+    resizable: false,
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
     },
   });
 
-  // Replace with your actual app UI
   mainWindow.loadURL(`data:text/html,
     <html>
-    <body style="font-family:sans-serif;padding:20px;background:#1a1a2e;color:#eee;">
-      <h2>Deceive Proxy</h2>
-      <p>Status: <strong style="color:#0f0;">Running</strong></p>
-      <p>You appear <strong>offline</strong> in Valorant.</p>
-      <p style="color:#888;font-size:12px;">Chat and game functionality remain active.</p>
+    <body style="font-family:system-ui,sans-serif;padding:24px;background:#0f1923;color:#ece8e1;margin:0;">
+      <h2 style="margin:0 0 8px 0;color:#ff4655;">Deceive Proxy</h2>
+      <p style="margin:4px 0;">Status: <strong style="color:#15e89f;">Running</strong></p>
+      <p style="margin:4px 0;">You appear <strong>offline</strong> in Valorant</p>
+      <hr style="border:1px solid #1f2d38;margin:16px 0;">
+      <p style="color:#768a96;font-size:13px;margin:4px 0;">How it works:</p>
+      <ol style="color:#768a96;font-size:12px;padding-left:18px;margin:8px 0;">
+        <li>Config proxy intercepts Riot's config request</li>
+        <li>Redirects chat connection to localhost</li>
+        <li>Chat TLS proxy filters presence stanzas</li>
+        <li>All other traffic (chat, game) passes through</li>
+      </ol>
+      <p style="color:#768a96;font-size:11px;margin-top:16px;">Close this window to stop the proxy and quit.</p>
     </body>
     </html>
   `);
 
-  mainWindow.on('closed', () => {
-    mainWindow = null;
-  });
+  mainWindow.on('closed', () => { mainWindow = null; });
 }
 
 app.on('ready', () => {
-  // Start the XMPP presence-blocking proxy
   startProxy(PROXY_CONFIG);
-  console.log('[main] Deceive proxy started');
-
   createWindow();
 });
 
@@ -53,25 +59,3 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   stopProxy();
 });
-
-// ---
-// Instructions:
-//
-// 1. Install dependencies:
-//    npm install electron node-forge
-//
-// 2. Run:
-//    npx electron main.js
-//
-// 3. The proxy intercepts Riot's XMPP chat connection on localhost:5223.
-//    Configure your Riot Client to connect to 127.0.0.1:5223 instead of
-//    the real chat server (this normally requires patching the Riot Client
-//    config response or using a system hosts file redirect paired with the
-//    self-signed cert).
-//
-// 4. Change PROXY_CONFIG.riotChatHost for your region:
-//    - NA: na.chat.si.riotgames.com
-//    - EU: eu.chat.si.riotgames.com
-//    - AP: ap.chat.si.riotgames.com
-//    - KR: kr.chat.si.riotgames.com
-// ---
