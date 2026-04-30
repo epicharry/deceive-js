@@ -169,15 +169,18 @@ function startConfigProxy(chatProxyPort) {
 
     try {
       const headers = {};
+      // DO NOT forward accept-encoding - we need plaintext responses to parse/patch
       const forwardHeaders = [
         'user-agent', 'authorization', 'x-riot-entitlements-jwt',
         'x-riot-rso-jwt', 'x-riot-clientplatform', 'x-riot-clientversion',
-        'accept', 'accept-encoding',
+        'accept',
       ];
       for (const h of forwardHeaders) {
         if (req.headers[h]) headers[h] = req.headers[h];
       }
       if (!headers['user-agent']) headers['user-agent'] = 'RiotClient';
+      // Force identity encoding so we get parseable text
+      headers['accept-encoding'] = 'identity';
 
       const response = await fetchUrlFull(url, headers);
 
