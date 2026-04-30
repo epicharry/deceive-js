@@ -145,102 +145,151 @@ function extractCompleteStanzas(buffer) {
 function filterOutgoingData(buffer) {
   const { stanzas, remaining } = extractCompleteStanzas(buffer);
   let output = '';
-  let blocked = false;
 
   for (const stanza of stanzas) {
     if (stanza.type === 'presence') {
-      blocked = true;
       console.log('[proxy] Blocked presence stanza');
     } else {
       output += stanza.data;
     }
   }
 
-  return { output, remaining, blocked };
+  return { output, remaining };
 }
 
 // ============================================================
-// Chat TLS Proxy (localhost:chatProxyPort <-> Riot Chat Server)
+// Chat TLS Proxy (localhost <-> Riot Chat Server)
 // ============================================================
 
 function startChatProxy(listenPort) {
   const { cert, key } = generateSelfSignedCert();
 
-  chatServer = tls.createServer({ key, cert }, (clientSocket) => {
-    console.log('[proxy] Riot Client connected to chat proxy');
+  chatServer = tls.createServer(
+    {
+      key,
+      cert,
+      // Be lenient with the TLS handshake
+      minVersion: 'TLSv1',
+      // Don't request client certificate
+      requestCert: false,
+    },
+    (clientSocket) => {
+      console.log('[proxy] Riot Client connected to chat proxy');
 
-    let clientBuffer = '';
-    let pendingData = [];
-    let riotSocket = null;
+      let clientBuffer = '';
+      let pendingData = [];
+      let riotSocket = null;
+      let riotConnected = false;
+      let destroyed = false;
 
-    // Wait for chatHost to be resolved by config proxy
-    function attemptConnect() {
-      if (!chatHost || !chatPort) {
-        setTimeout(attemptConnect, 100);
-        return;
+      function cleanup() {
+        if (destroyed) return;
+        destroyed = true;
+        if (riotSocket && !riotSocket.destroyed) riotSocket.destroy();
+        if (!clientSocket.destroyed) clientSocket.destroy();
+        connections = connections.filter((c) => c !== clientSocket);
       }
 
-      riotSocket = tls.connect(
-        { host: chatHost, port: chatPort, rejectUnauthorized: false },
-        () => {
-          console.log(`[proxy] Connected to Riot chat server: ${chatHost}:${chatPort}`);
-          for (const chunk of pendingData) {
-            processClientData(chunk);
-          }
-          pendingData = [];
+      // Wait for chatHost to be resolved by config proxy
+      function attemptConnect() {
+        if (destroyed) return;
+        if (!chatHost || !chatPort) {
+          setTimeout(attemptConnect, 100);
+          return;
         }
-      );
 
-      riotSocket.on('data', (data) => {
-        if (clientSocket.writable) clientSocket.write(data);
-      });
+        riotSocket = tls.connect(
+          {
+            host: chatHost,
+            port: chatPort,
+            rejectUnauthorized: false,
+            minVersion: 'TLSv1',
+          },
+          () => {
+            if (destroyed) { riotSocket.destroy(); return; }
+            riotConnected = true;
+            console.log(`[proxy] Connected to Riot chat: ${chatHost}:${chatPort}`);
+            // Flush buffered data
+            for (const chunk of pendingData) {
+              processClientData(chunk);
+            }
+            pendingData = [];
+          }
+        );
 
-      riotSocket.on('close', () => {
-        console.log('[proxy] Riot chat server disconnected');
-        if (clientSocket.writable) clientSocket.destroy();
-      });
+        // Riot -> Client (passthrough, raw bytes)
+        riotSocket.on('data', (data) => {
+          if (!clientSocket.destroyed && clientSocket.writable) {
+            clientSocket.write(data);
+          }
+        });
 
-      riotSocket.on('error', (err) => {
-        console.log('[proxy] Riot socket error:', err.message);
-        if (clientSocket.writable) clientSocket.destroy();
-      });
-    }
+        riotSocket.on('end', () => {
+          console.log('[proxy] Riot server sent FIN');
+          cleanup();
+        });
 
-    function processClientData(data) {
-      clientBuffer += data;
-      const { output, remaining } = filterOutgoingData(clientBuffer);
-      clientBuffer = remaining;
-      if (output.length > 0 && riotSocket && riotSocket.writable) {
-        riotSocket.write(output);
+        riotSocket.on('close', () => {
+          console.log('[proxy] Riot connection closed');
+          cleanup();
+        });
+
+        riotSocket.on('error', (err) => {
+          console.log('[proxy] Riot socket error:', err.message);
+          cleanup();
+        });
       }
-    }
 
-    clientSocket.on('data', (data) => {
-      const str = data.toString('utf-8');
-      if (!riotSocket || !riotSocket.writable) {
-        pendingData.push(str);
-        return;
+      function processClientData(str) {
+        clientBuffer += str;
+        const { output, remaining } = filterOutgoingData(clientBuffer);
+        clientBuffer = remaining;
+        if (output.length > 0 && riotSocket && riotSocket.writable) {
+          riotSocket.write(output);
+        }
       }
-      processClientData(str);
-    });
 
-    clientSocket.on('close', () => {
-      console.log('[proxy] Client disconnected from chat proxy');
-      if (riotSocket) riotSocket.destroy();
-      connections = connections.filter((c) => c !== clientSocket);
-    });
+      // Client -> Proxy (with presence filtering)
+      clientSocket.on('data', (data) => {
+        if (destroyed) return;
+        const str = data.toString('utf-8');
+        if (!riotConnected) {
+          pendingData.push(str);
+          return;
+        }
+        processClientData(str);
+      });
 
-    clientSocket.on('error', (err) => {
-      console.log('[proxy] Client socket error:', err.message);
-      if (riotSocket) riotSocket.destroy();
-    });
+      clientSocket.on('end', () => {
+        console.log('[proxy] Client sent FIN');
+        cleanup();
+      });
 
-    connections.push(clientSocket);
-    attemptConnect();
-  });
+      clientSocket.on('close', () => {
+        console.log('[proxy] Client disconnected');
+        cleanup();
+      });
+
+      clientSocket.on('error', (err) => {
+        // ECONNRESET is normal during TLS negotiation failures
+        if (err.code !== 'ECONNRESET') {
+          console.log('[proxy] Client socket error:', err.message);
+        }
+        cleanup();
+      });
+
+      connections.push(clientSocket);
+      attemptConnect();
+    }
+  );
 
   chatServer.listen(listenPort, '127.0.0.1', () => {
     console.log(`[proxy] Chat TLS proxy listening on 127.0.0.1:${chatServer.address().port}`);
+  });
+
+  chatServer.on('tlsClientError', (err, socket) => {
+    // This fires when TLS handshake fails - common during Riot's cert validation probes
+    console.log('[proxy] TLS client error (handshake failed):', err.message);
   });
 
   chatServer.on('error', (err) => {
@@ -260,6 +309,7 @@ function startConfigProxy(chatProxyPort) {
     console.log(`[config-proxy] Proxying: ${req.url}`);
 
     try {
+      // Build headers to forward
       const headers = {
         'User-Agent': req.headers['user-agent'] || 'RiotClient',
       };
@@ -269,43 +319,72 @@ function startConfigProxy(chatProxyPort) {
       if (req.headers['authorization']) {
         headers['Authorization'] = req.headers['authorization'];
       }
+      if (req.headers['x-riot-rso-jwt']) {
+        headers['X-Riot-RSO-JWT'] = req.headers['x-riot-rso-jwt'];
+      }
+      if (req.headers['x-riot-clientplatform']) {
+        headers['X-Riot-ClientPlatform'] = req.headers['x-riot-clientplatform'];
+      }
+      if (req.headers['x-riot-clientversion']) {
+        headers['X-Riot-ClientVersion'] = req.headers['x-riot-clientversion'];
+      }
 
-      const body = await fetchUrl(url, headers);
-      let config;
+      const response = await fetchUrlFull(url, headers);
 
-      try {
-        config = JSON.parse(body);
-      } catch {
-        // Not JSON, pass through
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end(body);
+      // If not 200, forward as-is
+      if (response.statusCode !== 200) {
+        res.writeHead(response.statusCode, { 'Content-Type': response.contentType });
+        res.end(response.body);
         return;
       }
 
-      let resolvedChatHost = null;
-      let resolvedChatPort = 0;
+      // Try to parse as JSON config
+      let config;
+      try {
+        config = JSON.parse(response.body);
+      } catch {
+        // Not JSON, forward unchanged
+        res.writeHead(200, { 'Content-Type': response.contentType });
+        res.end(response.body);
+        return;
+      }
 
-      // Patch chat.host
-      if (config['chat.host'] && typeof config['chat.host'] === 'string') {
+      // Only patch if this response contains chat configuration
+      const hasChatConfig = 'chat.host' in config || 'chat.affinities' in config || 'chat.port' in config;
+
+      if (!hasChatConfig) {
+        // No chat config in this response, forward unchanged
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(response.body);
+        return;
+      }
+
+      // --- Patch chat configuration ---
+      let resolvedChatHost = null;
+      let resolvedChatPort = 5223; // default
+
+      // Save and patch chat.host
+      if (typeof config['chat.host'] === 'string') {
         resolvedChatHost = config['chat.host'];
         config['chat.host'] = '127.0.0.1';
       }
 
-      // Patch chat.port
-      if (config['chat.port'] && typeof config['chat.port'] === 'number') {
+      // Save and patch chat.port
+      if (typeof config['chat.port'] === 'number') {
         resolvedChatPort = config['chat.port'];
-        config['chat.port'] = chatProxyPort;
       }
+      config['chat.port'] = chatProxyPort;
 
-      // Patch chat.affinities - resolve player's actual affinity
+      // Resolve player affinity and patch affinities
       if (config['chat.affinities'] && typeof config['chat.affinities'] === 'object') {
         const affinities = config['chat.affinities'];
 
         if (config['chat.affinity.enabled'] === true && req.headers['authorization']) {
           try {
-            const pasJwt = await fetchUrl(GEO_PAS_URL, {
+            const pasResponse = await fetchUrlFull(GEO_PAS_URL, {
               Authorization: req.headers['authorization'],
             });
+            const pasJwt = pasResponse.body;
             const parts = pasJwt.split('.');
             if (parts.length >= 2) {
               const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
@@ -320,19 +399,20 @@ function startConfigProxy(chatProxyPort) {
           }
         }
 
-        // Redirect all affinities to localhost
+        // Redirect ALL affinities to localhost
         for (const key of Object.keys(affinities)) {
           affinities[key] = '127.0.0.1';
         }
       }
 
-      // Allow bad cert (our self-signed)
-      if ('chat.allow_bad_cert.enabled' in config) {
-        config['chat.allow_bad_cert.enabled'] = true;
-      }
+      // CRITICAL: Force allow bad certs so Riot accepts our self-signed cert
+      config['chat.allow_bad_cert.enabled'] = true;
 
-      // Store resolved chat server for chat proxy to use
-      if (resolvedChatHost && resolvedChatPort) {
+      // Disable chat affinity so it uses chat.host directly
+      config['chat.affinity.enabled'] = false;
+
+      // Store resolved chat server for the TLS proxy
+      if (resolvedChatHost) {
         chatHost = resolvedChatHost;
         chatPort = resolvedChatPort;
         console.log(`[config-proxy] Real chat server: ${chatHost}:${chatPort}`);
@@ -341,6 +421,7 @@ function startConfigProxy(chatProxyPort) {
       const modified = JSON.stringify(config);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(modified);
+      console.log('[config-proxy] Patched chat config successfully');
     } catch (err) {
       console.error('[config-proxy] Error:', err.message);
       res.writeHead(502);
@@ -355,15 +436,22 @@ function startConfigProxy(chatProxyPort) {
   return configServer;
 }
 
-function fetchUrl(url, headers = {}) {
+function fetchUrlFull(url, headers = {}) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith('https') ? https : http;
     const req = mod.get(url, { headers, rejectUnauthorized: false }, (res) => {
       let data = '';
       res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => resolve(data));
+      res.on('end', () => {
+        resolve({
+          statusCode: res.statusCode,
+          contentType: res.headers['content-type'] || 'application/octet-stream',
+          body: data,
+        });
+      });
     });
     req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(new Error('Request timeout')); });
   });
 }
 
@@ -404,7 +492,7 @@ function isRiotClientRunning() {
 }
 
 function killRiotClient() {
-  const processes = ['RiotClientServices', 'RiotClientUx', 'RiotClientCrashHandler'];
+  const processes = ['RiotClientServices', 'RiotClientUx', 'RiotClientCrashHandler', 'VALORANT-Win64-Shipping'];
   for (const name of processes) {
     try {
       execSync(`taskkill /f /im ${name}.exe`, { stdio: 'ignore' });
@@ -434,25 +522,19 @@ function launchRiotClient(riotClientPath, configProxyPort) {
 // ============================================================
 
 function startProxy(options = {}) {
-  const chatProxyPort = options.chatProxyPort || 0; // 0 = random available port
+  const chatProxyPort = options.chatProxyPort || 0;
 
-  // Generate cert early
   generateSelfSignedCert();
 
-  // Start chat TLS proxy
   const chatSrv = startChatProxy(chatProxyPort);
 
-  // Wait for chat server to bind, then start config proxy + launch game
   chatSrv.on('listening', () => {
     const actualChatPort = chatSrv.address().port;
-
-    // Start config HTTP proxy
     const cfgSrv = startConfigProxy(actualChatPort);
 
     cfgSrv.on('listening', () => {
       const configPort = cfgSrv.address().port;
 
-      // Kill existing Riot Client and relaunch with our config proxy
       if (options.autoLaunch !== false) {
         if (isRiotClientRunning()) {
           console.log('[launcher] Killing existing Riot Client...');
@@ -479,7 +561,7 @@ function launchAfterKill(configPort, options) {
 
 function stopProxy() {
   for (const conn of connections) {
-    conn.destroy();
+    if (!conn.destroyed) conn.destroy();
   }
   connections = [];
   if (chatServer) { chatServer.close(); chatServer = null; }
