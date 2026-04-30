@@ -1,7 +1,7 @@
+const net = require('net');
 const tls = require('tls');
 const http = require('http');
 const https = require('https');
-const forge = require('node-forge');
 const { execSync, spawn } = require('child_process');
 const { existsSync, readFileSync } = require('fs');
 const { join } = require('path');
@@ -16,42 +16,6 @@ let chatServer = null;
 let chatHost = '';
 let chatPort = 0;
 let connections = [];
-let tlsCert = null;
-
-// ============================================================
-// Certificate Generation
-// ============================================================
-
-function generateSelfSignedCert() {
-  if (tlsCert) return tlsCert;
-
-  const keys = forge.pki.rsa.generateKeyPair(2048);
-  const cert = forge.pki.createCertificate();
-  cert.publicKey = keys.publicKey;
-  cert.serialNumber = '01';
-  cert.validity.notBefore = new Date();
-  cert.validity.notAfter = new Date();
-  cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 10);
-
-  const attrs = [
-    { name: 'commonName', value: 'Deceive Proxy CA' },
-    { name: 'organizationName', value: 'Deceive' },
-  ];
-  cert.setSubject(attrs);
-  cert.setIssuer(attrs);
-  cert.setExtensions([
-    { name: 'basicConstraints', cA: true },
-    { name: 'keyUsage', keyCertSign: true, digitalSignature: true, keyEncipherment: true },
-    { name: 'subjectAltName', altNames: [{ type: 2, value: 'localhost' }, { type: 7, ip: '127.0.0.1' }] },
-  ]);
-  cert.sign(keys.privateKey, forge.md.sha256.create());
-
-  tlsCert = {
-    cert: forge.pki.certificateToPem(cert),
-    key: forge.pki.privateKeyToPem(keys.privateKey),
-  };
-  return tlsCert;
-}
 
 // ============================================================
 // XMPP Stanza Parser + Presence Filter
@@ -158,138 +122,110 @@ function filterOutgoingData(buffer) {
 }
 
 // ============================================================
-// Chat TLS Proxy (localhost <-> Riot Chat Server)
+// Chat Proxy - Plain TCP on local side, TLS to Riot server
+//
+// Architecture:
+//   Riot Client --[plain TCP]--> Local Proxy --[TLS]--> Riot Chat Server
+//
+// We tell Riot to disable TLS for chat (chat.use_tls.enabled=false)
+// so it connects to us over plain TCP. We then establish a TLS
+// connection to the real Riot server on the upstream side.
+// This avoids all certificate trust issues.
 // ============================================================
 
 function startChatProxy(listenPort) {
-  const { cert, key } = generateSelfSignedCert();
+  chatServer = net.createServer((clientSocket) => {
+    console.log('[proxy] Riot Client connected (plain TCP)');
 
-  chatServer = tls.createServer(
-    {
-      key,
-      cert,
-      // Be lenient with the TLS handshake
-      minVersion: 'TLSv1',
-      // Don't request client certificate
-      requestCert: false,
-    },
-    (clientSocket) => {
-      console.log('[proxy] Riot Client connected to chat proxy');
+    let clientBuffer = '';
+    let pendingData = [];
+    let riotSocket = null;
+    let riotConnected = false;
+    let destroyed = false;
 
-      let clientBuffer = '';
-      let pendingData = [];
-      let riotSocket = null;
-      let riotConnected = false;
-      let destroyed = false;
-
-      function cleanup() {
-        if (destroyed) return;
-        destroyed = true;
-        if (riotSocket && !riotSocket.destroyed) riotSocket.destroy();
-        if (!clientSocket.destroyed) clientSocket.destroy();
-        connections = connections.filter((c) => c !== clientSocket);
-      }
-
-      // Wait for chatHost to be resolved by config proxy
-      function attemptConnect() {
-        if (destroyed) return;
-        if (!chatHost || !chatPort) {
-          setTimeout(attemptConnect, 100);
-          return;
-        }
-
-        riotSocket = tls.connect(
-          {
-            host: chatHost,
-            port: chatPort,
-            rejectUnauthorized: false,
-            minVersion: 'TLSv1',
-          },
-          () => {
-            if (destroyed) { riotSocket.destroy(); return; }
-            riotConnected = true;
-            console.log(`[proxy] Connected to Riot chat: ${chatHost}:${chatPort}`);
-            // Flush buffered data
-            for (const chunk of pendingData) {
-              processClientData(chunk);
-            }
-            pendingData = [];
-          }
-        );
-
-        // Riot -> Client (passthrough, raw bytes)
-        riotSocket.on('data', (data) => {
-          if (!clientSocket.destroyed && clientSocket.writable) {
-            clientSocket.write(data);
-          }
-        });
-
-        riotSocket.on('end', () => {
-          console.log('[proxy] Riot server sent FIN');
-          cleanup();
-        });
-
-        riotSocket.on('close', () => {
-          console.log('[proxy] Riot connection closed');
-          cleanup();
-        });
-
-        riotSocket.on('error', (err) => {
-          console.log('[proxy] Riot socket error:', err.message);
-          cleanup();
-        });
-      }
-
-      function processClientData(str) {
-        clientBuffer += str;
-        const { output, remaining } = filterOutgoingData(clientBuffer);
-        clientBuffer = remaining;
-        if (output.length > 0 && riotSocket && riotSocket.writable) {
-          riotSocket.write(output);
-        }
-      }
-
-      // Client -> Proxy (with presence filtering)
-      clientSocket.on('data', (data) => {
-        if (destroyed) return;
-        const str = data.toString('utf-8');
-        if (!riotConnected) {
-          pendingData.push(str);
-          return;
-        }
-        processClientData(str);
-      });
-
-      clientSocket.on('end', () => {
-        console.log('[proxy] Client sent FIN');
-        cleanup();
-      });
-
-      clientSocket.on('close', () => {
-        console.log('[proxy] Client disconnected');
-        cleanup();
-      });
-
-      clientSocket.on('error', (err) => {
-        // ECONNRESET is normal during TLS negotiation failures
-        if (err.code !== 'ECONNRESET') {
-          console.log('[proxy] Client socket error:', err.message);
-        }
-        cleanup();
-      });
-
-      connections.push(clientSocket);
-      attemptConnect();
+    function cleanup() {
+      if (destroyed) return;
+      destroyed = true;
+      if (riotSocket && !riotSocket.destroyed) riotSocket.destroy();
+      if (!clientSocket.destroyed) clientSocket.destroy();
+      connections = connections.filter((c) => c !== clientSocket);
     }
-  );
 
-  chatServer.listen(listenPort, '127.0.0.1', () => {
-    console.log(`[proxy] Chat TLS proxy listening on 127.0.0.1:${chatServer.address().port}`);
+    function attemptConnect() {
+      if (destroyed) return;
+      if (!chatHost || !chatPort) {
+        setTimeout(attemptConnect, 100);
+        return;
+      }
+
+      // Connect to the real Riot chat server over TLS
+      riotSocket = tls.connect(
+        {
+          host: chatHost,
+          port: chatPort,
+          rejectUnauthorized: false,
+        },
+        () => {
+          if (destroyed) { riotSocket.destroy(); return; }
+          riotConnected = true;
+          console.log(`[proxy] Connected to Riot chat (TLS): ${chatHost}:${chatPort}`);
+          for (const chunk of pendingData) {
+            processClientData(chunk);
+          }
+          pendingData = [];
+        }
+      );
+
+      // Riot -> Client (passthrough)
+      riotSocket.on('data', (data) => {
+        if (!clientSocket.destroyed && clientSocket.writable) {
+          clientSocket.write(data);
+        }
+      });
+
+      riotSocket.on('end', () => { cleanup(); });
+      riotSocket.on('close', () => { cleanup(); });
+      riotSocket.on('error', (err) => {
+        console.log('[proxy] Riot socket error:', err.message);
+        cleanup();
+      });
+    }
+
+    function processClientData(str) {
+      clientBuffer += str;
+      const { output, remaining } = filterOutgoingData(clientBuffer);
+      clientBuffer = remaining;
+      if (output.length > 0 && riotSocket && riotSocket.writable) {
+        riotSocket.write(output);
+      }
+    }
+
+    // Client -> Proxy (plain TCP, with presence filtering)
+    clientSocket.on('data', (data) => {
+      if (destroyed) return;
+      const str = data.toString('utf-8');
+      if (!riotConnected) {
+        pendingData.push(str);
+        return;
+      }
+      processClientData(str);
+    });
+
+    clientSocket.on('end', () => { cleanup(); });
+    clientSocket.on('close', () => { cleanup(); });
+    clientSocket.on('error', (err) => {
+      if (err.code !== 'ECONNRESET') {
+        console.log('[proxy] Client socket error:', err.message);
+      }
+      cleanup();
+    });
+
+    connections.push(clientSocket);
+    attemptConnect();
   });
 
-  chatServer.on('tlsClientError', (err, socket) => {
-    // This fires when TLS handshake fails - common during Riot's cert validation probes
-    console.log('[proxy] TLS client error (handshake failed):', err.message);
+  chatServer.listen(listenPort, '127.0.0.1', () => {
+    console.log(`[proxy] Chat proxy listening on 127.0.0.1:${chatServer.address().port} (plain TCP)`);
   });
 
   chatServer.on('error', (err) => {
@@ -300,7 +236,7 @@ function startChatProxy(listenPort) {
 }
 
 // ============================================================
-// Config HTTP Proxy (intercepts Riot client config requests)
+// Config HTTP Proxy
 // ============================================================
 
 function startConfigProxy(chatProxyPort) {
@@ -309,51 +245,38 @@ function startConfigProxy(chatProxyPort) {
     console.log(`[config-proxy] Proxying: ${req.url}`);
 
     try {
-      // Build headers to forward
-      const headers = {
-        'User-Agent': req.headers['user-agent'] || 'RiotClient',
-      };
-      if (req.headers['x-riot-entitlements-jwt']) {
-        headers['X-Riot-Entitlements-JWT'] = req.headers['x-riot-entitlements-jwt'];
+      const headers = {};
+      // Forward all relevant headers
+      const forwardHeaders = [
+        'user-agent', 'authorization', 'x-riot-entitlements-jwt',
+        'x-riot-rso-jwt', 'x-riot-clientplatform', 'x-riot-clientversion',
+      ];
+      for (const h of forwardHeaders) {
+        if (req.headers[h]) headers[h] = req.headers[h];
       }
-      if (req.headers['authorization']) {
-        headers['Authorization'] = req.headers['authorization'];
-      }
-      if (req.headers['x-riot-rso-jwt']) {
-        headers['X-Riot-RSO-JWT'] = req.headers['x-riot-rso-jwt'];
-      }
-      if (req.headers['x-riot-clientplatform']) {
-        headers['X-Riot-ClientPlatform'] = req.headers['x-riot-clientplatform'];
-      }
-      if (req.headers['x-riot-clientversion']) {
-        headers['X-Riot-ClientVersion'] = req.headers['x-riot-clientversion'];
-      }
+      if (!headers['user-agent']) headers['user-agent'] = 'RiotClient';
 
       const response = await fetchUrlFull(url, headers);
 
-      // If not 200, forward as-is
       if (response.statusCode !== 200) {
         res.writeHead(response.statusCode, { 'Content-Type': response.contentType });
         res.end(response.body);
         return;
       }
 
-      // Try to parse as JSON config
       let config;
       try {
         config = JSON.parse(response.body);
       } catch {
-        // Not JSON, forward unchanged
         res.writeHead(200, { 'Content-Type': response.contentType });
         res.end(response.body);
         return;
       }
 
-      // Only patch if this response contains chat configuration
+      // Only patch responses that contain chat configuration
       const hasChatConfig = 'chat.host' in config || 'chat.affinities' in config || 'chat.port' in config;
 
       if (!hasChatConfig) {
-        // No chat config in this response, forward unchanged
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(response.body);
         return;
@@ -361,21 +284,19 @@ function startConfigProxy(chatProxyPort) {
 
       // --- Patch chat configuration ---
       let resolvedChatHost = null;
-      let resolvedChatPort = 5223; // default
+      let resolvedChatPort = 5223;
 
-      // Save and patch chat.host
       if (typeof config['chat.host'] === 'string') {
         resolvedChatHost = config['chat.host'];
         config['chat.host'] = '127.0.0.1';
       }
 
-      // Save and patch chat.port
       if (typeof config['chat.port'] === 'number') {
         resolvedChatPort = config['chat.port'];
       }
       config['chat.port'] = chatProxyPort;
 
-      // Resolve player affinity and patch affinities
+      // Resolve player affinity
       if (config['chat.affinities'] && typeof config['chat.affinities'] === 'object') {
         const affinities = config['chat.affinities'];
 
@@ -384,14 +305,12 @@ function startConfigProxy(chatProxyPort) {
             const pasResponse = await fetchUrlFull(GEO_PAS_URL, {
               Authorization: req.headers['authorization'],
             });
-            const pasJwt = pasResponse.body;
-            const parts = pasJwt.split('.');
+            const parts = pasResponse.body.split('.');
             if (parts.length >= 2) {
               const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-              const affinity = payload.affinity;
-              if (affinity && affinities[affinity]) {
-                resolvedChatHost = affinities[affinity];
-                console.log(`[config-proxy] Player affinity: ${affinity} -> ${resolvedChatHost}`);
+              if (payload.affinity && affinities[payload.affinity]) {
+                resolvedChatHost = affinities[payload.affinity];
+                console.log(`[config-proxy] Player affinity: ${payload.affinity} -> ${resolvedChatHost}`);
               }
             }
           } catch (err) {
@@ -399,19 +318,19 @@ function startConfigProxy(chatProxyPort) {
           }
         }
 
-        // Redirect ALL affinities to localhost
         for (const key of Object.keys(affinities)) {
           affinities[key] = '127.0.0.1';
         }
       }
 
-      // CRITICAL: Force allow bad certs so Riot accepts our self-signed cert
-      config['chat.allow_bad_cert.enabled'] = true;
+      // CRITICAL: Disable TLS for chat so Riot connects to us over plain TCP
+      // This eliminates all certificate trust issues
+      config['chat.use_tls.enabled'] = false;
 
-      // Disable chat affinity so it uses chat.host directly
+      // Disable affinity so it uses chat.host directly
       config['chat.affinity.enabled'] = false;
 
-      // Store resolved chat server for the TLS proxy
+      // Store the real chat server for our upstream TLS connection
       if (resolvedChatHost) {
         chatHost = resolvedChatHost;
         chatPort = resolvedChatPort;
@@ -421,7 +340,7 @@ function startConfigProxy(chatProxyPort) {
       const modified = JSON.stringify(config);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(modified);
-      console.log('[config-proxy] Patched chat config successfully');
+      console.log('[config-proxy] Patched chat config (TLS disabled for local connection)');
     } catch (err) {
       console.error('[config-proxy] Error:', err.message);
       res.writeHead(502);
@@ -523,8 +442,6 @@ function launchRiotClient(riotClientPath, configProxyPort) {
 
 function startProxy(options = {}) {
   const chatProxyPort = options.chatProxyPort || 0;
-
-  generateSelfSignedCert();
 
   const chatSrv = startChatProxy(chatProxyPort);
 
